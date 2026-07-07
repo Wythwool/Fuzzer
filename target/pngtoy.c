@@ -1,43 +1,131 @@
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include "../cov/cov.h"
-static uint32_t be32(const unsigned char* p){ return (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3]; }
-int main(int argc, char** argv){
-    if(argc<2){ fprintf(stderr,"usage: %s <file>\n", argv[0]); return 2; }
-    FILE* f=fopen(argv[1],"rb"); if(!f){ perror("open"); return 2; }
-    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-    if(sz<8){ fclose(f); return 0; }
-    unsigned char* b=malloc(sz); if(!b){ fclose(f); return 2; }
-    fread(b,1,sz,f); fclose(f);
-    if(sz<8 || memcmp(b,"\x89PNG\r\n\x1a\n",8)!=0){ free(b); return 0; }
-    COV_POINT();
-    if(sz<33){ free(b); return 0; }
-    uint32_t ih_len=be32(b+8); COV_POINT();
-    if(memcmp(b+12,"IHDR",4)!=0){ free(b); return 0; }
-    if(ih_len<13){ free(b); return 0; }
-    uint32_t W=be32(b+16), H=be32(b+20); COV_POINT();
-    if(W==0 || H==0 || W>20000 || H>20000){ free(b); return 0; }
-    size_t maxpix=(size_t)W*(size_t)H;
-    size_t cap=(maxpix>0 && maxpix<65536)?maxpix:65536;
-    unsigned char* img=malloc(cap);
-    size_t off=0;
-    size_t p=8;
-    while(p+8<=(size_t)sz){
-        uint32_t clen=be32(b+p); p+=4;
-        if(p+4>(size_t)sz) break;
-        char ctype[5]={0}; memcpy(ctype,b+p,4); p+=4; COV_POINT();
-        if(p+clen+4>(size_t)sz) break;
-        if(!memcmp(ctype,"IDAT",4)){
-            COV_POINT();
-            memcpy(img+off,b+p,clen); // BUG: no bounds check
-            off+=clen;
-        }else if(!memcmp(ctype,"IEND",4)){ COV_POINT(); break; }
-        else{ COV_POINT(); }
-        p+=clen+4;
+
+static uint32_t be32(const unsigned char *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static unsigned char *read_file(const char *path, size_t *len)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        perror("open");
+        return NULL;
     }
-    if(off>cap){ fprintf(stderr,"[BUG] overflow off=%zu cap=%zu\n",off,cap); }
-    free(img); free(b);
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    long size = ftell(file);
+    if (size < 0) {
+        fclose(file);
+        return NULL;
+    }
+    rewind(file);
+
+    unsigned char *buf = malloc((size_t)size);
+    if (!buf && size > 0) {
+        fclose(file);
+        return NULL;
+    }
+    if (size > 0 && fread(buf, 1, (size_t)size, file) != (size_t)size) {
+        free(buf);
+        fclose(file);
+        return NULL;
+    }
+
+    fclose(file);
+    *len = (size_t)size;
+    return buf;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <file>\n", argv[0]);
+        return 2;
+    }
+
+    size_t size = 0;
+    unsigned char *buf = read_file(argv[1], &size);
+    if (!buf) {
+        return 2;
+    }
+    if (size < 8 || memcmp(buf, "\x89PNG\r\n\x1a\n", 8) != 0) {
+        free(buf);
+        return 0;
+    }
+    COV_POINT();
+
+    if (size < 33) {
+        free(buf);
+        return 0;
+    }
+
+    uint32_t ihdr_len = be32(buf + 8);
+    COV_POINT();
+    if (memcmp(buf + 12, "IHDR", 4) != 0 || ihdr_len < 13) {
+        free(buf);
+        return 0;
+    }
+
+    uint32_t width = be32(buf + 16);
+    uint32_t height = be32(buf + 20);
+    COV_POINT();
+    if (width == 0 || height == 0 || width > 20000 || height > 20000) {
+        free(buf);
+        return 0;
+    }
+
+    size_t pixels = (size_t)width * (size_t)height;
+    size_t cap = (pixels > 0 && pixels < 65536) ? pixels : 65536;
+    unsigned char *image = malloc(cap);
+    if (!image) {
+        free(buf);
+        return 2;
+    }
+
+    size_t off = 0;
+    size_t pos = 8;
+    while (pos + 8 <= size) {
+        uint32_t chunk_len = be32(buf + pos);
+        pos += 4;
+        if (pos + 4 > size) {
+            break;
+        }
+
+        char chunk_type[5] = {0};
+        memcpy(chunk_type, buf + pos, 4);
+        pos += 4;
+        COV_POINT();
+
+        if (pos + chunk_len + 4 > size) {
+            break;
+        }
+        if (memcmp(chunk_type, "IDAT", 4) == 0) {
+            COV_POINT();
+            memcpy(image + off, buf + pos, chunk_len);
+            off += chunk_len;
+        } else if (memcmp(chunk_type, "IEND", 4) == 0) {
+            COV_POINT();
+            break;
+        } else {
+            COV_POINT();
+        }
+        pos += chunk_len + 4;
+    }
+
+    if (off > cap) {
+        fprintf(stderr, "[BUG] overflow off=%zu cap=%zu\n", off, cap);
+    }
+
+    free(image);
+    free(buf);
     return 0;
 }

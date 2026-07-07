@@ -1,57 +1,221 @@
 #!/usr/bin/env python3
-import os, sys, time, random, subprocess
-from pathlib import Path
+import argparse
+import hashlib
+import json
+import os
+import random
+import subprocess
+import time
+from dataclasses import dataclass
 from multiprocessing import shared_memory
-MAP_SIZE=1<<16; TIMEOUT=0.25
-def mutate(d: bytes)->bytes:
-    b=bytearray(d)
-    c=random.randint(0,4)
-    if c==0 and len(b): 
-        for _ in range(random.randint(1,8)):
-            i=random.randrange(len(b)); b[i]^=1<<random.randrange(8)
-    elif c==1 and len(b):
-        for _ in range(random.randint(1,8)):
-            i=random.randrange(len(b)); b[i]=random.choice([0,0xff,0x7f,0x80])
-    elif c==2:
-        pos=random.randrange(len(b)+1); chunk=os.urandom(random.randint(1,16)); b[pos:pos]=chunk
-    elif c==3 and len(b)>2:
-        pos=random.randrange(len(b)-1); ln=random.randint(1,min(16,len(b)-pos)); del b[pos:pos+ln]
+from pathlib import Path
+
+MAP_SIZE = 1 << 16
+DEFAULT_TIMEOUT = 0.25
+
+
+@dataclass
+class RunResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    elapsed_ms: float
+    timed_out: bool = False
+
+    @property
+    def crashed(self) -> bool:
+        if self.timed_out:
+            return False
+        return (
+            self.returncode < 0
+            or self.returncode in {11, 134, 139}
+            or b"AddressSanitizer" in self.stderr
+            or b"UndefinedBehaviorSanitizer" in self.stderr
+        )
+
+
+def mutate(data: bytes, rng: random.Random) -> bytes:
+    if not data:
+        return os.urandom(1)
+
+    buf = bytearray(data)
+    choice = rng.randint(0, 6)
+    if choice == 0:
+        for _ in range(rng.randint(1, 8)):
+            pos = rng.randrange(len(buf))
+            buf[pos] ^= 1 << rng.randrange(8)
+    elif choice == 1:
+        for _ in range(rng.randint(1, 8)):
+            pos = rng.randrange(len(buf))
+            buf[pos] = rng.choice([0, 1, 0x7F, 0x80, 0xFF])
+    elif choice == 2:
+        pos = rng.randrange(len(buf) + 1)
+        buf[pos:pos] = rng.randbytes(rng.randint(1, 32))
+    elif choice == 3 and len(buf) > 2:
+        pos = rng.randrange(len(buf) - 1)
+        size = rng.randint(1, min(32, len(buf) - pos))
+        del buf[pos : pos + size]
+    elif choice == 4:
+        pos = rng.randrange(len(buf))
+        width = rng.choice([0, 1, 2, 4])
+        value = rng.choice([0, 1, 0xFFFF, 0xFFFFFFFF, rng.getrandbits(32)])
+        raw = value.to_bytes(4, "big")
+        buf[pos : pos + width] = raw[:width]
+    elif choice == 5:
+        src = rng.randrange(len(buf))
+        size = rng.randint(1, min(32, len(buf) - src))
+        dst = rng.randrange(len(buf) + 1)
+        buf[dst:dst] = buf[src : src + size]
     else:
-        for _ in range(random.randint(1,4)):
-            i=random.randrange(len(b)); b[i]=(b[i]+random.randint(-35,35))&0xff
-    return bytes(b)
-def run(bin_path, inp, shm):
-    shm.buf[:] = b'\x00'*MAP_SIZE
-    env=os.environ.copy(); env['COV_SHM']=shm.name
+        for _ in range(rng.randint(1, 4)):
+            pos = rng.randrange(len(buf))
+            buf[pos] = (buf[pos] + rng.randint(-35, 35)) & 0xFF
+    return bytes(buf)
+
+
+def run_target(target: str, input_path: Path, shm: shared_memory.SharedMemory, timeout: float) -> RunResult:
+    shm.buf[:] = b"\x00" * MAP_SIZE
+    env = os.environ.copy()
+    env["COV_SHM"] = shm.name
+    start = time.perf_counter()
     try:
-        p=subprocess.run([bin_path, str(inp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
-        return p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired:
-        return 999, b'', b'timeout'
-def cov_gain(global_map, shm):
-    g=0; buf=shm.buf
-    for i in range(MAP_SIZE):
-        if buf[i] and not global_map[i]: global_map[i]=1; g+=1
-    return g
-def main():
-    if len(sys.argv)<3: print("usage: fuzz.py <target_bin> <corpus_dir> [out_dir]"); sys.exit(1)
-    bin_path=sys.argv[1]; corp=Path(sys.argv[2]); corp.mkdir(exist_ok=True); out=Path(sys.argv[3] if len(sys.argv)>3 else "findings"); out.mkdir(exist_ok=True)
-    crashes=(out/'crashes'); crashes.mkdir(exist_ok=True); queue=(out/'queue'); queue.mkdir(exist_ok=True)
-    q=[p for p in corp.iterdir() if p.is_file()]
-    if not q: print("[-] empty corpus"); sys.exit(1)
-    shm=shared_memory.SharedMemory(create=True,size=MAP_SIZE); global_map=bytearray(MAP_SIZE); it=0
-    while True:
-        it+=1
-        parent=random.choice(q); data=parent.read_bytes(); child=mutate(data)
-        tmp=out/'cur.bin'; tmp.write_bytes(child)
-        rc, outb, errb=run(bin_path, tmp, shm)
-        gain=cov_gain(global_map, shm)
-        if rc<0 or (b'AddressSanitizer' in errb) or rc in (139,134,11):
-            ts=int(time.time()*1000); (crashes/f"id_{ts}.bin").write_bytes(child); (crashes/f"id_{ts}.log").write_bytes(errb or outb)
-            print(f"[CRASH] id_{ts}.bin rc={rc} +edges={gain}")
-        elif gain>0:
-            nid=len(list(queue.iterdir())); pth=queue/f"id_{nid:06d}.bin"; pth.write_bytes(child); q.append(pth)
-            print(f"[+] new path {pth.name} +edges={gain} corpus={len(q)}")
-        if it%100==0: print(f"iter={it} total_edges={sum(global_map)} corpus={len(q)}")
-if __name__=='__main__':
-    random.seed(os.urandom(8)); main()
+        proc = subprocess.run(
+            [target, str(input_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+        elapsed = (time.perf_counter() - start) * 1000
+        return RunResult(proc.returncode, proc.stdout, proc.stderr, elapsed)
+    except subprocess.TimeoutExpired as exc:
+        elapsed = (time.perf_counter() - start) * 1000
+        return RunResult(124, exc.stdout or b"", exc.stderr or b"timeout", elapsed, True)
+
+
+def merge_coverage(global_map: bytearray, shm: shared_memory.SharedMemory) -> int:
+    gain = 0
+    for idx, value in enumerate(shm.buf):
+        if value and not global_map[idx]:
+            global_map[idx] = 1
+            gain += 1
+    return gain
+
+
+def load_corpus(corpus_dir: Path) -> list[Path]:
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    return sorted(path for path in corpus_dir.iterdir() if path.is_file())
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def crash_key(data: bytes, result: RunResult) -> str:
+    digest = hashlib.sha256()
+    digest.update(data)
+    digest.update(str(result.returncode).encode())
+    digest.update(result.stderr[:2048])
+    return digest.hexdigest()[:16]
+
+
+def fuzz(args: argparse.Namespace) -> int:
+    rng = random.Random(args.seed if args.seed is not None else int.from_bytes(os.urandom(8), "big"))
+    corpus = load_corpus(args.corpus)
+    if not corpus:
+        raise SystemExit("empty corpus")
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    crashes = args.out / "crashes"
+    queue = args.out / "queue"
+    crashes.mkdir(exist_ok=True)
+    queue.mkdir(exist_ok=True)
+
+    global_map = bytearray(MAP_SIZE)
+    seen_crashes: set[str] = set()
+    stats = {
+        "runs": 0,
+        "crashes": 0,
+        "unique_crashes": 0,
+        "timeouts": 0,
+        "new_paths": 0,
+        "edges": 0,
+        "corpus": len(corpus),
+        "start_time": time.time(),
+    }
+
+    shm = shared_memory.SharedMemory(create=True, size=MAP_SIZE)
+    current = args.out / ".cur_input"
+    try:
+        while args.max_runs == 0 or stats["runs"] < args.max_runs:
+            parent = rng.choice(corpus)
+            child = mutate(parent.read_bytes(), rng)
+            current.write_bytes(child)
+            result = run_target(args.target, current, shm, args.timeout)
+            gain = merge_coverage(global_map, shm)
+
+            stats["runs"] += 1
+            stats["edges"] = sum(1 for byte in global_map if byte)
+            if result.timed_out:
+                stats["timeouts"] += 1
+
+            if result.crashed:
+                stats["crashes"] += 1
+                key = crash_key(child, result)
+                if key not in seen_crashes:
+                    seen_crashes.add(key)
+                    stats["unique_crashes"] += 1
+                    crash_path = crashes / f"id_{stats['unique_crashes']:06d}_{key}.bin"
+                    log_path = crash_path.with_suffix(".log")
+                    crash_path.write_bytes(child)
+                    log_path.write_bytes(result.stderr or result.stdout)
+                    if not args.quiet:
+                        print(f"[CRASH] {crash_path.name} rc={result.returncode} +edges={gain}")
+            elif gain > 0:
+                stats["new_paths"] += 1
+                queue_path = queue / f"id_{stats['new_paths']:06d}.bin"
+                queue_path.write_bytes(child)
+                corpus.append(queue_path)
+                stats["corpus"] = len(corpus)
+                if not args.quiet:
+                    print(f"[+] new path {queue_path.name} +edges={gain} corpus={len(corpus)}")
+
+            if stats["runs"] % args.report_every == 0:
+                save_json(args.out / "stats.json", stats)
+                if not args.quiet:
+                    print(
+                        f"runs={stats['runs']} edges={stats['edges']} "
+                        f"corpus={stats['corpus']} crashes={stats['unique_crashes']}"
+                    )
+        save_json(args.out / "stats.json", stats)
+    finally:
+        try:
+            current.unlink(missing_ok=True)
+        finally:
+            shm.close()
+            shm.unlink()
+
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Small coverage-guided fuzzer")
+    parser.add_argument("target")
+    parser.add_argument("corpus", type=Path)
+    parser.add_argument("out", type=Path, nargs="?", default=Path("findings"))
+    parser.add_argument("--max-runs", type=int, default=0, help="0 means run until interrupted")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--report-every", type=int, default=100)
+    parser.add_argument("--quiet", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    return fuzz(parse_args())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

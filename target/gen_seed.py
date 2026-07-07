@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-import struct, zlib, sys
-def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t+d)&0xffffffff)
-sig=b"\x89PNG\r\n\x1a\n"
-ihdr=chunk(b'IHDR', struct.pack(">IIBBBBB",1,1,8,2,0,0,0))
-idat=chunk(b'IDAT', zlib.compress(b'\x00\x00\x00'))
-iend=chunk(b'IEND', b'')
-sys.stdout.buffer.write(sig+ihdr+idat+iend)
+import struct
+import sys
+import zlib
+
+
+def chunk(kind: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+
+sig = b"\x89PNG\r\n\x1a\n"
+ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0))
+idat = chunk(b"IDAT", zlib.compress(b"\x00" + (b"\x11\x22\x33" * 16)))
+iend = chunk(b"IEND", b"")
+sys.stdout.buffer.write(sig + ihdr + idat + iend)
